@@ -1,66 +1,73 @@
-import { useState, useEffect, useRef, useCallback } from "react";
+import { useState, useEffect, useRef } from "react";
 import { createClient } from "@supabase/supabase-js";
 
-// ── Supabase config ──────────────────────────────────────────────
 const SUPABASE_URL = "https://gtwqaxbkabktdyiebcvx.supabase.co";
 const SUPABASE_ANON_KEY = "sb_publishable_VkwqdAhEdn_lzYq3wUBARg_M0ckx7Pd";
 const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
-// ────────────────────────────────────────────────────────────────
 
 const STATUS_CONFIG = {
-  "Pending":     { color: "#f59e0b", bg: "rgba(245,158,11,0.12)"  },
-  "In Progress": { color: "#3b82f6", bg: "rgba(59,130,246,0.12)"  },
-  "Done":        { color: "#10b981", bg: "rgba(16,185,129,0.12)"  },
+  "Pending":     { color: "#f59e0b", bg: "rgba(245,158,11,0.12)" },
+  "In Progress": { color: "#3b82f6", bg: "rgba(59,130,246,0.12)" },
+  "Done":        { color: "#10b981", bg: "rgba(16,185,129,0.12)" },
 };
 
-const emptyEvent = (index) => ({
+const emptyEvent = (batchId, index) => ({
   id: Date.now().toString() + Math.random(),
-  slNo: index + 1,
-  eventName: "",
-  assignedTo: "Execom",
+  batch_id: batchId,
+  sl_no: index + 1,
+  event_name: "",
+  assigned_to: "Execom",
   deadline: "",
   reassigned: "",
-  foldersCount: 0,
-  momsCount: 0,
+  folders_count: 0,
+  moms_count: 0,
   status: "Pending",
   notes: "",
-});
-
-const newBatchObj = (name) => ({
-  id: Date.now().toString(),
-  name,
-  seedMembers: [],
-  events: [],
-  createdAt: new Date().toISOString(),
+  _dirty: true,
 });
 
 export default function App() {
   const [batches, setBatches]             = useState([]);
   const [activeBatchId, setActiveBatchId] = useState(null);
+  const [members, setMembers]             = useState({}); // { batchId: [...] }
+  const [events, setEvents]               = useState({}); // { batchId: [...] }
   const [view, setView]                   = useState("home");
   const [loading, setLoading]             = useState(true);
-  const [saving, setSaving]               = useState(false);
+  const [committing, setCommitting]       = useState(false);
+  const [commitStatus, setCommitStatus]   = useState(null); // null | "ok" | "err"
   const [newBatchName, setNewBatchName]   = useState("");
   const [newMemberName, setNewMemberName] = useState("");
   const [editingCell, setEditingCell]     = useState(null);
   const [editValue, setEditValue]         = useState("");
   const [showMemberPanel, setShowMemberPanel] = useState(false);
   const [confirmDelete, setConfirmDelete] = useState(null);
-  const inputRef  = useRef();
-  const saveTimer = useRef(null);
+  const inputRef = useRef();
 
-  // ── Load from Supabase on mount ──
+  // ── Load everything on mount ──
   useEffect(() => {
     (async () => {
       setLoading(true);
-      const { data, error } = await supabase
-        .from("batches")
-        .select("*")
-        .order("created_at", { ascending: true });
-      if (!error && data) {
-        const parsed = data.map(row => ({ ...row.data, id: row.id, name: row.name }));
-        setBatches(parsed);
-        if (parsed.length > 0) { setActiveBatchId(parsed[0].id); setView("batch"); }
+      const [bRes, mRes, eRes] = await Promise.all([
+        supabase.from("batches").select("*").order("created_at", { ascending: true }),
+        supabase.from("seed_members").select("*"),
+        supabase.from("events").select("*").order("sl_no", { ascending: true }),
+      ]);
+
+      const batchList = bRes.data || [];
+      setBatches(batchList);
+
+      const memberMap = {};
+      const eventMap  = {};
+      for (const b of batchList) {
+        memberMap[b.id] = (mRes.data || []).filter(m => m.batch_id === b.id);
+        eventMap[b.id]  = (eRes.data || []).filter(e => e.batch_id === b.id);
+      }
+      setMembers(memberMap);
+      setEvents(eventMap);
+
+      if (batchList.length > 0) {
+        setActiveBatchId(batchList[0].id);
+        setView("batch");
       }
       setLoading(false);
     })();
@@ -70,123 +77,149 @@ export default function App() {
     if (editingCell && inputRef.current) inputRef.current.focus();
   }, [editingCell]);
 
-  // ── Debounced save ──
-  const scheduleSave = useCallback((updatedBatches) => {
-    if (saveTimer.current) clearTimeout(saveTimer.current);
-    saveTimer.current = setTimeout(async () => {
-      setSaving(true);
-      for (const batch of updatedBatches) {
-        await supabase.from("batches").upsert({
-          id: batch.id, name: batch.name, data: batch, created_at: batch.createdAt,
-        });
-      }
-      setSaving(false);
-    }, 800);
-  }, []);
+  const activeBatch   = batches.find(b => b.id === activeBatchId);
+  const activeMembers = activeBatchId ? (members[activeBatchId] || []) : [];
+  const activeEvents  = activeBatchId ? (events[activeBatchId] || []) : [];
+  const dirtyEvents   = activeEvents.filter(e => e._dirty);
+  const hasDirty      = dirtyEvents.length > 0;
 
-  const activeBatch = batches.find(b => b.id === activeBatchId);
-
-  function updateBatches(updater) {
-    setBatches(prev => { const next = updater(prev); scheduleSave(next); return next; });
+  // ── Helpers ──
+  function setActiveBatchEvents(updater) {
+    setEvents(prev => ({ ...prev, [activeBatchId]: updater(prev[activeBatchId] || []) }));
   }
-  function updateBatch(batchId, updater) {
-    updateBatches(prev => prev.map(b => b.id === batchId ? updater(b) : b));
+  function setActiveBatchMembers(updater) {
+    setMembers(prev => ({ ...prev, [activeBatchId]: updater(prev[activeBatchId] || []) }));
   }
 
   // ── Batch ops ──
   async function createBatch() {
     if (!newBatchName.trim()) return;
-    const batch = newBatchObj(newBatchName.trim());
-    setSaving(true);
-    const { error } = await supabase.from("batches").insert({
-      id: batch.id, name: batch.name, data: batch, created_at: batch.createdAt,
-    });
-    setSaving(false);
+    const batch = { id: Date.now().toString(), name: newBatchName.trim(), created_at: new Date().toISOString() };
+    const { error } = await supabase.from("batches").insert(batch);
     if (!error) {
       setBatches(prev => [...prev, batch]);
-      setActiveBatchId(batch.id); setNewBatchName(""); setView("batch");
+      setMembers(prev => ({ ...prev, [batch.id]: [] }));
+      setEvents(prev => ({ ...prev, [batch.id]: [] }));
+      setActiveBatchId(batch.id);
+      setNewBatchName("");
+      setView("batch");
     }
   }
 
   async function deleteBatch(id) {
-    await supabase.from("batches").delete().eq("id", id);
+    await Promise.all([
+      supabase.from("events").delete().eq("batch_id", id),
+      supabase.from("seed_members").delete().eq("batch_id", id),
+      supabase.from("batches").delete().eq("id", id),
+    ]);
     setBatches(prev => {
       const next = prev.filter(b => b.id !== id);
       const newActive = next[0]?.id || null;
-      setActiveBatchId(newActive); setView(newActive ? "batch" : "home");
+      setActiveBatchId(newActive);
+      setView(newActive ? "batch" : "home");
       return next;
     });
     setConfirmDelete(null);
   }
 
   // ── Member ops ──
-  function addMember() {
-    if (!newMemberName.trim() || !activeBatch) return;
-    updateBatch(activeBatch.id, b => ({
-      ...b, seedMembers: [...b.seedMembers, { id: Date.now().toString(), name: newMemberName.trim() }],
-    }));
-    setNewMemberName("");
+  async function addMember() {
+    if (!newMemberName.trim() || !activeBatchId) return;
+    const m = { id: Date.now().toString(), batch_id: activeBatchId, name: newMemberName.trim() };
+    const { error } = await supabase.from("seed_members").insert(m);
+    if (!error) {
+      setActiveBatchMembers(prev => [...prev, m]);
+      setNewMemberName("");
+    }
   }
-  function removeMember(memberId) {
-    updateBatch(activeBatch.id, b => {
-      const name = b.seedMembers.find(m => m.id === memberId)?.name;
-      return {
-        ...b,
-        seedMembers: b.seedMembers.filter(m => m.id !== memberId),
-        events: b.events.map(e => e.assignedTo === name ? { ...e, assignedTo: "Execom" } : e),
-      };
-    });
+
+  async function removeMember(memberId) {
+    const memberName = activeMembers.find(m => m.id === memberId)?.name;
+    await supabase.from("seed_members").delete().eq("id", memberId);
+    setActiveBatchMembers(prev => prev.filter(m => m.id !== memberId));
+    // reassign their events to Execom locally (mark dirty)
+    setActiveBatchEvents(prev => prev.map(e =>
+      e.assigned_to === memberName ? { ...e, assigned_to: "Execom", _dirty: true } : e
+    ));
   }
 
   // ── Event ops ──
   function addEvent() {
-    if (!activeBatch) return;
-    updateBatch(activeBatch.id, b => ({ ...b, events: [...b.events, emptyEvent(b.events.length)] }));
+    if (!activeBatchId) return;
+    const ev = emptyEvent(activeBatchId, activeEvents.length);
+    setActiveBatchEvents(prev => [...prev, ev]);
   }
-  function removeEvent(eventId) {
-    updateBatch(activeBatch.id, b => ({
-      ...b, events: b.events.filter(e => e.id !== eventId).map((e, i) => ({ ...e, slNo: i + 1 })),
-    }));
+
+  async function removeEvent(eventId) {
+    const ev = activeEvents.find(e => e.id === eventId);
+    if (!ev._dirty) await supabase.from("events").delete().eq("id", eventId); // only delete from DB if it was committed
+    setActiveBatchEvents(prev =>
+      prev.filter(e => e.id !== eventId).map((e, i) => ({ ...e, sl_no: i + 1, _dirty: e._dirty || true }))
+    );
   }
+
   function updateEventField(eventId, field, value) {
-    updateBatch(activeBatch.id, b => ({
-      ...b, events: b.events.map(e => e.id === eventId ? { ...e, [field]: value } : e),
-    }));
+    setActiveBatchEvents(prev =>
+      prev.map(e => e.id === eventId ? { ...e, [field]: value, _dirty: true } : e)
+    );
   }
+
   function startEdit(eventId, field, currentValue) {
-    setEditingCell({ eventId, field }); setEditValue(String(currentValue));
+    setEditingCell({ eventId, field });
+    setEditValue(String(currentValue ?? ""));
   }
+
   function commitEdit() {
     if (!editingCell) return;
     updateEventField(editingCell.eventId, editingCell.field, editValue);
     setEditingCell(null);
   }
 
+  // ── COMMIT to Supabase ──
+  async function commitChanges() {
+    if (!hasDirty) return;
+    setCommitting(true);
+    setCommitStatus(null);
+
+    const toUpsert = dirtyEvents.map(({ _dirty, ...e }) => e);
+    const { error } = await supabase.from("events").upsert(toUpsert);
+
+    if (!error) {
+      setActiveBatchEvents(prev => prev.map(e => ({ ...e, _dirty: false })));
+      setCommitStatus("ok");
+      setTimeout(() => setCommitStatus(null), 3000);
+    } else {
+      setCommitStatus("err");
+    }
+    setCommitting(false);
+  }
+
   // ── Stats ──
-  function batchStats(batch) {
+  function batchStats() {
     return {
-      total: batch.events.length,
-      done: batch.events.filter(e => e.status === "Done").length,
-      inProgress: batch.events.filter(e => e.status === "In Progress").length,
-      totalFolders: batch.events.reduce((s, e) => s + Number(e.foldersCount || 0), 0),
-      totalMoms: batch.events.reduce((s, e) => s + Number(e.momsCount || 0), 0),
+      total: activeEvents.length,
+      done: activeEvents.filter(e => e.status === "Done").length,
+      inProgress: activeEvents.filter(e => e.status === "In Progress").length,
+      totalFolders: activeEvents.reduce((s, e) => s + Number(e.folders_count || 0), 0),
+      totalMoms: activeEvents.reduce((s, e) => s + Number(e.moms_count || 0), 0),
     };
   }
-  function memberStats(batch) {
+
+  function memberStats() {
     const stats = {};
-    for (const m of batch.seedMembers) {
-      const a = batch.events.filter(e => e.assignedTo === m.name);
+    for (const m of activeMembers) {
+      const a = activeEvents.filter(e => e.assigned_to === m.name);
       stats[m.name] = {
         events: a.length,
-        folders: a.reduce((s, e) => s + Number(e.foldersCount || 0), 0),
-        moms: a.reduce((s, e) => s + Number(e.momsCount || 0), 0),
+        folders: a.reduce((s, e) => s + Number(e.folders_count || 0), 0),
+        moms: a.reduce((s, e) => s + Number(e.moms_count || 0), 0),
         done: a.filter(e => e.status === "Done").length,
       };
     }
     return stats;
   }
 
-  const assigneeOptions = activeBatch ? ["Execom", ...activeBatch.seedMembers.map(m => m.name)] : ["Execom"];
+  const assigneeOptions = ["Execom", ...activeMembers.map(m => m.name)];
 
   return (
     <div style={S.root}>
@@ -198,12 +231,11 @@ export default function App() {
           <span style={S.logoIcon}>⟁</span>
           <span style={S.logoText}>SEED<br /><span style={S.logoSub}>Doc Tracker</span></span>
         </div>
-        {saving && <div style={S.savingBadge}>saving…</div>}
         <div style={S.sidebarSection}>BATCHES</div>
         {batches.map(b => (
           <div key={b.id}
             style={{ ...S.batchItem, ...(activeBatchId === b.id && view === "batch" ? S.batchItemActive : {}) }}
-            onClick={() => { setActiveBatchId(b.id); setView("batch"); }}>
+            onClick={() => { setActiveBatchId(b.id); setView("batch"); setShowMemberPanel(false); }}>
             <span style={S.batchDot} />
             <span style={S.batchItemName}>{b.name}</span>
             <span style={S.batchDeleteBtn} onClick={e => { e.stopPropagation(); setConfirmDelete(b.id); }}>×</span>
@@ -215,6 +247,7 @@ export default function App() {
 
       {/* MAIN */}
       <main style={S.main}>
+
         {loading && (
           <div style={S.centerPage}>
             <div style={{ ...S.heroIcon, animation: "spin 1.5s linear infinite" }}>⟁</div>
@@ -245,22 +278,50 @@ export default function App() {
         )}
 
         {!loading && view === "batch" && activeBatch && (() => {
-          const stats  = batchStats(activeBatch);
-          const mStats = memberStats(activeBatch);
+          const stats  = batchStats();
+          const mStats = memberStats();
           return (
             <div style={S.batchView}>
+
+              {/* Header */}
               <div style={S.batchHeader}>
                 <div>
                   <h1 style={S.batchTitle}>{activeBatch.name}</h1>
                   <span style={S.batchDate}>
-                    Created {new Date(activeBatch.createdAt).toLocaleDateString("en-IN", { day: "numeric", month: "short", year: "numeric" })}
+                    Created {new Date(activeBatch.created_at).toLocaleDateString("en-IN", { day: "numeric", month: "short", year: "numeric" })}
                   </span>
                 </div>
-                <button style={S.membersBtn} onClick={() => setShowMemberPanel(p => !p)}>
-                  👥 Seed Members ({activeBatch.seedMembers.length})
-                </button>
+                <div style={{ display: "flex", gap: "10px", alignItems: "center" }}>
+                  <button style={S.membersBtn} onClick={() => setShowMemberPanel(p => !p)}>
+                    👥 Seed Members ({activeMembers.length})
+                  </button>
+
+                  {/* COMMIT BUTTON */}
+                  <button
+                    style={{
+                      ...S.commitBtn,
+                      ...(hasDirty ? S.commitBtnActive : S.commitBtnDisabled),
+                    }}
+                    onClick={commitChanges}
+                    disabled={!hasDirty || committing}
+                  >
+                    {committing ? "Saving…" :
+                     commitStatus === "ok" ? "✓ Saved!" :
+                     commitStatus === "err" ? "✗ Error" :
+                     hasDirty ? `⬆ Commit (${dirtyEvents.length} change${dirtyEvents.length > 1 ? "s" : ""})` :
+                     "✓ All saved"}
+                  </button>
+                </div>
               </div>
 
+              {/* Dirty banner */}
+              {hasDirty && (
+                <div style={S.dirtyBanner}>
+                  ⚠ You have {dirtyEvents.length} unsaved change{dirtyEvents.length > 1 ? "s" : ""}. Hit <strong>Commit</strong> to save to Supabase.
+                </div>
+              )}
+
+              {/* Stats */}
               <div style={S.statsBar}>
                 <StatCard label="Total Events"  value={stats.total}        accent="#e2c27d" />
                 <StatCard label="Done"           value={stats.done}         accent="#10b981" />
@@ -269,6 +330,7 @@ export default function App() {
                 <StatCard label="Total MOMs"     value={stats.totalMoms}    accent="#f472b6" />
               </div>
 
+              {/* Member panel */}
               {showMemberPanel && (
                 <div style={S.memberPanel}>
                   <div style={S.memberPanelHeader}>
@@ -276,12 +338,16 @@ export default function App() {
                     <button style={S.closeBtn} onClick={() => setShowMemberPanel(false)}>×</button>
                   </div>
                   <div style={S.memberList}>
-                    {activeBatch.seedMembers.length === 0 && <span style={{ color: "#555", fontSize: "12px" }}>No members yet.</span>}
-                    {activeBatch.seedMembers.map(m => (
+                    {activeMembers.length === 0 && <span style={{ color: "#555", fontSize: "12px" }}>No members yet.</span>}
+                    {activeMembers.map(m => (
                       <div key={m.id} style={S.memberChip}>
                         <span style={S.memberAvatar}>{m.name[0].toUpperCase()}</span>
                         <span style={S.memberChipName}>{m.name}</span>
-                        {mStats[m.name] && <span style={S.memberMiniStats}>{mStats[m.name].events}ev · {mStats[m.name].folders}f · {mStats[m.name].moms}m</span>}
+                        {mStats[m.name] && (
+                          <span style={S.memberMiniStats}>
+                            {mStats[m.name].events}ev · {mStats[m.name].folders}f · {mStats[m.name].moms}m
+                          </span>
+                        )}
                         <button style={S.removeMember} onClick={() => removeMember(m.id)}>×</button>
                       </div>
                     ))}
@@ -295,63 +361,96 @@ export default function App() {
                 </div>
               )}
 
+              {/* Table */}
               <div style={S.tableWrap}>
                 <table style={S.table}>
                   <thead>
-                    <tr>{["#","Event Name","Assigned To","Deadline","Reassigned","Folders","MOMs","Status","Notes",""].map((h,i) => <th key={i} style={S.th}>{h}</th>)}</tr>
+                    <tr>
+                      {["#", "Event Name", "Assigned To", "Deadline", "Reassigned", "Folders", "MOMs", "Status", "Notes", ""].map((h, i) => (
+                        <th key={i} style={S.th}>{h}</th>
+                      ))}
+                    </tr>
                   </thead>
                   <tbody>
-                    {activeBatch.events.map(ev => (
-                      <tr key={ev.id} style={S.tr} className="table-row">
-                        <td style={S.td}><span style={S.slNo}>{ev.slNo}</span></td>
+                    {activeEvents.map(ev => (
+                      <tr key={ev.id} style={{ ...S.tr, ...(ev._dirty ? S.trDirty : {}) }} className="table-row">
 
-                        <td style={S.td} onClick={() => startEdit(ev.id, "eventName", ev.eventName)}>
-                          {editingCell?.eventId === ev.id && editingCell?.field === "eventName"
-                            ? <input ref={inputRef} style={S.cellInput} value={editValue} onChange={e => setEditValue(e.target.value)} onBlur={commitEdit} onKeyDown={e => e.key === "Enter" && commitEdit()} />
-                            : <span style={S.cellText}>{ev.eventName || <span style={S.placeholder}>Click to edit</span>}</span>}
+                        <td style={S.td}>
+                          <span style={S.slNo}>{ev.sl_no}</span>
+                          {ev._dirty && <span style={S.dirtyDot} title="Unsaved" />}
+                        </td>
+
+                        <td style={S.td} onClick={() => startEdit(ev.id, "event_name", ev.event_name)}>
+                          {editingCell?.eventId === ev.id && editingCell?.field === "event_name"
+                            ? <input ref={inputRef} style={S.cellInput} value={editValue}
+                                onChange={e => setEditValue(e.target.value)}
+                                onBlur={commitEdit} onKeyDown={e => e.key === "Enter" && commitEdit()} />
+                            : <span style={S.cellText}>{ev.event_name || <span style={S.placeholder}>Click to edit</span>}</span>}
                         </td>
 
                         <td style={S.td}>
-                          <select style={S.selectCell} value={ev.assignedTo} onChange={e => updateEventField(ev.id, "assignedTo", e.target.value)}>
+                          <select style={S.selectCell} value={ev.assigned_to}
+                            onChange={e => updateEventField(ev.id, "assigned_to", e.target.value)}>
                             {assigneeOptions.map(o => <option key={o}>{o}</option>)}
                           </select>
                         </td>
 
                         <td style={S.td} onClick={() => startEdit(ev.id, "deadline", ev.deadline)}>
                           {editingCell?.eventId === ev.id && editingCell?.field === "deadline"
-                            ? <input ref={inputRef} type="date" style={S.cellInput} value={editValue} onChange={e => setEditValue(e.target.value)} onBlur={commitEdit} onKeyDown={e => e.key === "Enter" && commitEdit()} />
-                            : <span style={S.cellText}>{ev.deadline ? new Date(ev.deadline + "T00:00:00").toLocaleDateString("en-IN", { day: "numeric", month: "short" }) : <span style={S.placeholder}>—</span>}</span>}
+                            ? <input ref={inputRef} type="date" style={S.cellInput} value={editValue}
+                                onChange={e => setEditValue(e.target.value)}
+                                onBlur={commitEdit} onKeyDown={e => e.key === "Enter" && commitEdit()} />
+                            : <span style={S.cellText}>
+                                {ev.deadline
+                                  ? new Date(ev.deadline + "T00:00:00").toLocaleDateString("en-IN", { day: "numeric", month: "short" })
+                                  : <span style={S.placeholder}>—</span>}
+                              </span>}
                         </td>
 
                         <td style={S.td}>
-                          <select style={{ ...S.selectCell, color: ev.reassigned ? "#f472b6" : "#555" }} value={ev.reassigned} onChange={e => updateEventField(ev.id, "reassigned", e.target.value)}>
+                          <select style={{ ...S.selectCell, color: ev.reassigned ? "#f472b6" : "#555" }}
+                            value={ev.reassigned || ""}
+                            onChange={e => updateEventField(ev.id, "reassigned", e.target.value)}>
                             <option value="">—</option>
                             {assigneeOptions.map(o => <option key={o}>{o}</option>)}
                           </select>
                         </td>
 
-                        <td style={S.td} onClick={() => startEdit(ev.id, "foldersCount", ev.foldersCount)}>
-                          {editingCell?.eventId === ev.id && editingCell?.field === "foldersCount"
-                            ? <input ref={inputRef} type="number" min="0" style={{ ...S.cellInput, width: "52px" }} value={editValue} onChange={e => setEditValue(e.target.value)} onBlur={commitEdit} onKeyDown={e => e.key === "Enter" && commitEdit()} />
-                            : <span style={{ ...S.cellText, textAlign: "center" }}><span style={S.countBadge}>{ev.foldersCount}</span></span>}
+                        <td style={S.td} onClick={() => startEdit(ev.id, "folders_count", ev.folders_count)}>
+                          {editingCell?.eventId === ev.id && editingCell?.field === "folders_count"
+                            ? <input ref={inputRef} type="number" min="0" style={{ ...S.cellInput, width: "52px" }}
+                                value={editValue} onChange={e => setEditValue(e.target.value)}
+                                onBlur={commitEdit} onKeyDown={e => e.key === "Enter" && commitEdit()} />
+                            : <span style={{ ...S.cellText, textAlign: "center" }}><span style={S.countBadge}>{ev.folders_count}</span></span>}
                         </td>
 
-                        <td style={S.td} onClick={() => startEdit(ev.id, "momsCount", ev.momsCount)}>
-                          {editingCell?.eventId === ev.id && editingCell?.field === "momsCount"
-                            ? <input ref={inputRef} type="number" min="0" style={{ ...S.cellInput, width: "52px" }} value={editValue} onChange={e => setEditValue(e.target.value)} onBlur={commitEdit} onKeyDown={e => e.key === "Enter" && commitEdit()} />
-                            : <span style={{ ...S.cellText, textAlign: "center" }}><span style={S.countBadge}>{ev.momsCount}</span></span>}
+                        <td style={S.td} onClick={() => startEdit(ev.id, "moms_count", ev.moms_count)}>
+                          {editingCell?.eventId === ev.id && editingCell?.field === "moms_count"
+                            ? <input ref={inputRef} type="number" min="0" style={{ ...S.cellInput, width: "52px" }}
+                                value={editValue} onChange={e => setEditValue(e.target.value)}
+                                onBlur={commitEdit} onKeyDown={e => e.key === "Enter" && commitEdit()} />
+                            : <span style={{ ...S.cellText, textAlign: "center" }}><span style={S.countBadge}>{ev.moms_count}</span></span>}
                         </td>
 
                         <td style={S.td}>
-                          <select style={{ ...S.selectCell, color: STATUS_CONFIG[ev.status].color, background: STATUS_CONFIG[ev.status].bg, borderColor: STATUS_CONFIG[ev.status].color + "44", fontWeight: "600" }}
-                            value={ev.status} onChange={e => updateEventField(ev.id, "status", e.target.value)}>
+                          <select style={{
+                            ...S.selectCell,
+                            color: STATUS_CONFIG[ev.status].color,
+                            background: STATUS_CONFIG[ev.status].bg,
+                            borderColor: STATUS_CONFIG[ev.status].color + "44",
+                            fontWeight: "600",
+                          }}
+                            value={ev.status}
+                            onChange={e => updateEventField(ev.id, "status", e.target.value)}>
                             {Object.keys(STATUS_CONFIG).map(s => <option key={s}>{s}</option>)}
                           </select>
                         </td>
 
                         <td style={S.td} onClick={() => startEdit(ev.id, "notes", ev.notes)}>
                           {editingCell?.eventId === ev.id && editingCell?.field === "notes"
-                            ? <input ref={inputRef} style={{ ...S.cellInput, minWidth: "140px" }} value={editValue} onChange={e => setEditValue(e.target.value)} onBlur={commitEdit} onKeyDown={e => e.key === "Enter" && commitEdit()} />
+                            ? <input ref={inputRef} style={{ ...S.cellInput, minWidth: "140px" }} value={editValue}
+                                onChange={e => setEditValue(e.target.value)}
+                                onBlur={commitEdit} onKeyDown={e => e.key === "Enter" && commitEdit()} />
                             : <span style={{ ...S.cellText, color: "#aaa" }}>{ev.notes || <span style={S.placeholder}>—</span>}</span>}
                         </td>
 
@@ -362,16 +461,17 @@ export default function App() {
                     ))}
                   </tbody>
                 </table>
-                {activeBatch.events.length === 0 && <div style={S.emptyTable}>No events yet. Add one below ↓</div>}
+                {activeEvents.length === 0 && <div style={S.emptyTable}>No events yet. Add one below ↓</div>}
               </div>
 
               <button style={S.addEventBtn} onClick={addEvent}>+ Add Event</button>
 
-              {activeBatch.seedMembers.length > 0 && (
+              {/* Member workload */}
+              {activeMembers.length > 0 && (
                 <div style={S.memberSummary}>
                   <div style={S.sectionLabel}>MEMBER WORKLOAD</div>
                   <div style={S.memberCards}>
-                    {activeBatch.seedMembers.map(m => {
+                    {activeMembers.map(m => {
                       const s = mStats[m.name] || {};
                       return (
                         <div key={m.id} style={S.memberCard}>
@@ -394,12 +494,13 @@ export default function App() {
         })()}
       </main>
 
+      {/* Delete modal */}
       {confirmDelete && (
         <div style={S.modalOverlay} onClick={() => setConfirmDelete(null)}>
           <div style={S.modal} onClick={e => e.stopPropagation()}>
             <h3 style={{ color: "#e2c27d", fontFamily: "'Playfair Display', serif", marginBottom: "8px" }}>Delete Batch?</h3>
             <p style={{ color: "#aaa", fontSize: "13px", marginBottom: "20px" }}>
-              This will permanently delete <strong style={{ color: "#fff" }}>{batches.find(b => b.id === confirmDelete)?.name}</strong> and all its data.
+              This permanently deletes <strong style={{ color: "#fff" }}>{batches.find(b => b.id === confirmDelete)?.name}</strong>, all its events and members.
             </p>
             <div style={{ display: "flex", gap: "10px" }}>
               <button style={S.cancelBtn} onClick={() => setConfirmDelete(null)}>Cancel</button>
@@ -433,7 +534,7 @@ const css = `
   @import url('https://fonts.googleapis.com/css2?family=Playfair+Display:wght@600;700&family=DM+Mono:wght@400;500&display=swap');
   * { box-sizing: border-box; margin: 0; padding: 0; }
   body { background: #0d0d0d; }
-  .table-row:hover td { background: rgba(226,194,125,0.04) !important; }
+  .table-row:hover td { background: rgba(226,194,125,0.03) !important; }
   select option { background: #1a1a1a; color: #e0e0e0; }
   ::-webkit-scrollbar { width: 6px; height: 6px; }
   ::-webkit-scrollbar-track { background: #111; }
@@ -449,7 +550,6 @@ const S = {
   logoIcon: { fontSize: "24px", color: "#e2c27d", lineHeight: 1 },
   logoText: { fontSize: "13px", fontWeight: "600", color: "#e2c27d", lineHeight: "1.3", fontFamily: "'Playfair Display', serif" },
   logoSub: { fontSize: "10px", color: "#888", fontFamily: "'DM Mono', monospace", fontWeight: 400 },
-  savingBadge: { fontSize: "9px", color: "#555", textAlign: "center", padding: "4px", letterSpacing: "0.1em" },
   sidebarSection: { fontSize: "9px", letterSpacing: "0.15em", color: "#555", padding: "16px 20px 6px", fontWeight: "500" },
   batchItem: { display: "flex", alignItems: "center", gap: "8px", padding: "9px 20px", cursor: "pointer", borderLeft: "2px solid transparent" },
   batchItemActive: { background: "rgba(226,194,125,0.08)", borderLeftColor: "#e2c27d" },
@@ -469,10 +569,14 @@ const S = {
   inputRow: { display: "flex", gap: "10px", alignItems: "center" },
   bigInput: { padding: "10px 16px", background: "#1a1a1a", border: "1px solid #2e2e2e", borderRadius: "6px", color: "#e0e0e0", fontSize: "14px", fontFamily: "'DM Mono', monospace", outline: "none", width: "280px" },
   batchView: { padding: "32px 32px 60px", minHeight: "100%" },
-  batchHeader: { display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: "24px" },
+  batchHeader: { display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: "16px" },
   batchTitle: { fontFamily: "'Playfair Display', serif", fontSize: "28px", color: "#e2c27d", lineHeight: 1 },
   batchDate: { fontSize: "11px", color: "#555", display: "block", marginTop: "6px" },
   membersBtn: { padding: "8px 16px", background: "#1a1a1a", border: "1px solid #2e2e2e", borderRadius: "6px", color: "#ccc", cursor: "pointer", fontSize: "12px", fontFamily: "'DM Mono', monospace" },
+  commitBtn: { padding: "8px 18px", borderRadius: "6px", border: "none", cursor: "pointer", fontSize: "12px", fontFamily: "'DM Mono', monospace", fontWeight: "600", transition: "all 0.2s" },
+  commitBtnActive: { background: "#e2c27d", color: "#0d0d0d" },
+  commitBtnDisabled: { background: "#1a1a1a", color: "#444", border: "1px solid #2a2a2a", cursor: "default" },
+  dirtyBanner: { background: "rgba(245,158,11,0.08)", border: "1px solid rgba(245,158,11,0.2)", borderRadius: "8px", padding: "10px 14px", fontSize: "12px", color: "#f59e0b", marginBottom: "16px" },
   statsBar: { display: "flex", gap: "12px", marginBottom: "24px", flexWrap: "wrap" },
   statCard: { flex: "1 1 100px", background: "#111", border: "1px solid", borderRadius: "10px", padding: "14px 16px", display: "flex", flexDirection: "column", gap: "4px" },
   statVal: { fontSize: "26px", fontFamily: "'Playfair Display', serif", lineHeight: 1 },
@@ -493,8 +597,10 @@ const S = {
   table: { width: "100%", borderCollapse: "collapse", minWidth: "900px" },
   th: { padding: "10px 12px", textAlign: "left", fontSize: "9px", letterSpacing: "0.12em", color: "#555", borderBottom: "1px solid #1e1e1e", fontWeight: "500", background: "#0f0f0f", whiteSpace: "nowrap" },
   tr: { borderBottom: "1px solid #191919" },
+  trDirty: { borderLeft: "2px solid #f59e0b44" },
   td: { padding: "8px 12px", fontSize: "12px", verticalAlign: "middle" },
   slNo: { width: "24px", height: "24px", background: "#1a1a1a", borderRadius: "4px", display: "inline-flex", alignItems: "center", justifyContent: "center", fontSize: "10px", color: "#555" },
+  dirtyDot: { display: "inline-block", width: "5px", height: "5px", borderRadius: "50%", background: "#f59e0b", marginLeft: "4px", verticalAlign: "middle" },
   cellText: { display: "block", color: "#ddd", cursor: "text" },
   cellInput: { background: "#1a1a1a", border: "1px solid #e2c27d66", borderRadius: "4px", color: "#e0e0e0", padding: "3px 6px", fontSize: "12px", outline: "none", fontFamily: "'DM Mono', monospace", width: "100%" },
   placeholder: { color: "#3a3a3a", fontStyle: "italic" },
