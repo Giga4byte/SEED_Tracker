@@ -12,62 +12,71 @@ const STATUS_CONFIG = {
 };
 
 const emptyEvent = (batchId, index) => ({
-  id: Date.now().toString() + Math.random(),
+  id: crypto.randomUUID(),
   batch_id: batchId,
   sl_no: index + 1,
   event_name: "",
   assigned_to: "Execom",
-  deadline: "",
-  reassigned: "",
+  deadline: null,
+  reassigned: null,
   folders_count: 0,
   moms_count: 0,
   status: "Pending",
-  notes: "",
+  notes: null,
   _dirty: true,
 });
 
 export default function App() {
-  const [batches, setBatches]             = useState([]);
-  const [activeBatchId, setActiveBatchId] = useState(null);
-  const [members, setMembers]             = useState({}); // { batchId: [...] }
-  const [events, setEvents]               = useState({}); // { batchId: [...] }
-  const [view, setView]                   = useState("home");
-  const [loading, setLoading]             = useState(true);
-  const [committing, setCommitting]       = useState(false);
-  const [commitStatus, setCommitStatus]   = useState(null); // null | "ok" | "err"
-  const [newBatchName, setNewBatchName]   = useState("");
-  const [newMemberName, setNewMemberName] = useState("");
-  const [editingCell, setEditingCell]     = useState(null);
-  const [editValue, setEditValue]         = useState("");
+  const [batches, setBatches]                 = useState([]);
+  const [activeBatchId, setActiveBatchId]     = useState(null);
+  const [members, setMembers]                 = useState({});
+  const [events, setEvents]                   = useState({});
+  const [view, setView]                       = useState("home");
+  const [loading, setLoading]                 = useState(true);
+  const [committing, setCommitting]           = useState(false);
+  const [commitStatus, setCommitStatus]       = useState(null);
+  const [commitError, setCommitError]         = useState(null);
+  const [newBatchName, setNewBatchName]       = useState("");
+  const [newMemberName, setNewMemberName]     = useState("");
+  const [editingCell, setEditingCell]         = useState(null);
+  const [editValue, setEditValue]             = useState("");
   const [showMemberPanel, setShowMemberPanel] = useState(false);
-  const [confirmDelete, setConfirmDelete] = useState(null);
+  const [confirmDelete, setConfirmDelete]     = useState(null);
   const inputRef = useRef();
 
   // ── Load everything on mount ──
   useEffect(() => {
     (async () => {
       setLoading(true);
-      const [bRes, mRes, eRes] = await Promise.all([
-        supabase.from("batches").select("*").order("created_at", { ascending: true }),
-        supabase.from("seed_members").select("*"),
-        supabase.from("events").select("*").order("sl_no", { ascending: true }),
-      ]);
+      try {
+        const [bRes, mRes, eRes] = await Promise.all([
+          supabase.from("batches").select("*").order("created_at", { ascending: true }),
+          supabase.from("seed_members").select("*"),
+          supabase.from("events").select("*").order("sl_no", { ascending: true }),
+        ]);
 
-      const batchList = bRes.data || [];
-      setBatches(batchList);
+        if (bRes.error) { console.error("batches error:", bRes.error); }
+        if (mRes.error) { console.error("members error:", mRes.error); }
+        if (eRes.error) { console.error("events error:",  eRes.error); }
 
-      const memberMap = {};
-      const eventMap  = {};
-      for (const b of batchList) {
-        memberMap[b.id] = (mRes.data || []).filter(m => m.batch_id === b.id);
-        eventMap[b.id]  = (eRes.data || []).filter(e => e.batch_id === b.id);
-      }
-      setMembers(memberMap);
-      setEvents(eventMap);
+        const batchList = bRes.data || [];
+        setBatches(batchList);
 
-      if (batchList.length > 0) {
-        setActiveBatchId(batchList[0].id);
-        setView("batch");
+        const memberMap = {};
+        const eventMap  = {};
+        for (const b of batchList) {
+          memberMap[b.id] = (mRes.data || []).filter(m => m.batch_id === b.id);
+          eventMap[b.id]  = (eRes.data || []).filter(e => e.batch_id === b.id).map(e => ({ ...e, _dirty: false }));
+        }
+        setMembers(memberMap);
+        setEvents(eventMap);
+
+        if (batchList.length > 0) {
+          setActiveBatchId(batchList[0].id);
+          setView("batch");
+        }
+      } catch (err) {
+        console.error("Load error:", err);
       }
       setLoading(false);
     })();
@@ -79,11 +88,10 @@ export default function App() {
 
   const activeBatch   = batches.find(b => b.id === activeBatchId);
   const activeMembers = activeBatchId ? (members[activeBatchId] || []) : [];
-  const activeEvents  = activeBatchId ? (events[activeBatchId] || []) : [];
+  const activeEvents  = activeBatchId ? (events[activeBatchId]  || []) : [];
   const dirtyEvents   = activeEvents.filter(e => e._dirty);
   const hasDirty      = dirtyEvents.length > 0;
 
-  // ── Helpers ──
   function setActiveBatchEvents(updater) {
     setEvents(prev => ({ ...prev, [activeBatchId]: updater(prev[activeBatchId] || []) }));
   }
@@ -94,26 +102,32 @@ export default function App() {
   // ── Batch ops ──
   async function createBatch() {
     if (!newBatchName.trim()) return;
-    const batch = { id: Date.now().toString(), name: newBatchName.trim(), created_at: new Date().toISOString() };
+    const batch = {
+      id: crypto.randomUUID(),
+      name: newBatchName.trim(),
+      created_at: new Date().toISOString(),
+    };
     const { error } = await supabase.from("batches").insert(batch);
-    if (!error) {
-      setBatches(prev => [...prev, batch]);
-      setMembers(prev => ({ ...prev, [batch.id]: [] }));
-      setEvents(prev => ({ ...prev, [batch.id]: [] }));
-      setActiveBatchId(batch.id);
-      setNewBatchName("");
-      setView("batch");
-    }
+    if (error) { console.error("Create batch error:", error); alert("Error creating batch: " + error.message); return; }
+    setBatches(prev => [...prev, batch]);
+    setMembers(prev => ({ ...prev, [batch.id]: [] }));
+    setEvents(prev  => ({ ...prev, [batch.id]: [] }));
+    setActiveBatchId(batch.id);
+    setNewBatchName("");
+    setView("batch");
   }
 
   async function deleteBatch(id) {
-    await Promise.all([
+    const [e1, e2, e3] = await Promise.all([
       supabase.from("events").delete().eq("batch_id", id),
       supabase.from("seed_members").delete().eq("batch_id", id),
       supabase.from("batches").delete().eq("id", id),
     ]);
+    if (e1.error || e2.error || e3.error) {
+      console.error("Delete errors:", e1.error, e2.error, e3.error);
+    }
     setBatches(prev => {
-      const next = prev.filter(b => b.id !== id);
+      const next      = prev.filter(b => b.id !== id);
       const newActive = next[0]?.id || null;
       setActiveBatchId(newActive);
       setView(newActive ? "batch" : "home");
@@ -125,22 +139,25 @@ export default function App() {
   // ── Member ops ──
   async function addMember() {
     if (!newMemberName.trim() || !activeBatchId) return;
-    const m = { id: Date.now().toString(), batch_id: activeBatchId, name: newMemberName.trim() };
+    const m = {
+      id: crypto.randomUUID(),
+      batch_id: activeBatchId,
+      name: newMemberName.trim(),
+    };
     const { error } = await supabase.from("seed_members").insert(m);
-    if (!error) {
-      setActiveBatchMembers(prev => [...prev, m]);
-      setNewMemberName("");
-    }
+    if (error) { console.error("Add member error:", error); alert("Error adding member: " + error.message); return; }
+    setActiveBatchMembers(prev => [...prev, m]);
+    setNewMemberName("");
   }
 
   async function removeMember(memberId) {
     const memberName = activeMembers.find(m => m.id === memberId)?.name;
-    await supabase.from("seed_members").delete().eq("id", memberId);
+    const { error } = await supabase.from("seed_members").delete().eq("id", memberId);
+    if (error) { console.error("Remove member error:", error); return; }
     setActiveBatchMembers(prev => prev.filter(m => m.id !== memberId));
-    // reassign their events to Execom locally (mark dirty)
-    setActiveBatchEvents(prev => prev.map(e =>
-      e.assigned_to === memberName ? { ...e, assigned_to: "Execom", _dirty: true } : e
-    ));
+    setActiveBatchEvents(prev =>
+      prev.map(e => e.assigned_to === memberName ? { ...e, assigned_to: "Execom", _dirty: true } : e)
+    );
   }
 
   // ── Event ops ──
@@ -152,9 +169,12 @@ export default function App() {
 
   async function removeEvent(eventId) {
     const ev = activeEvents.find(e => e.id === eventId);
-    if (!ev._dirty) await supabase.from("events").delete().eq("id", eventId); // only delete from DB if it was committed
+    if (ev && !ev._dirty) {
+      const { error } = await supabase.from("events").delete().eq("id", eventId);
+      if (error) { console.error("Delete event error:", error); return; }
+    }
     setActiveBatchEvents(prev =>
-      prev.filter(e => e.id !== eventId).map((e, i) => ({ ...e, sl_no: i + 1, _dirty: e._dirty || true }))
+      prev.filter(e => e.id !== eventId).map((e, i) => ({ ...e, sl_no: i + 1, _dirty: true }))
     );
   }
 
@@ -177,31 +197,56 @@ export default function App() {
 
   // ── COMMIT to Supabase ──
   async function commitChanges() {
-    if (!hasDirty) return;
+    if (!hasDirty || committing) return;
     setCommitting(true);
     setCommitStatus(null);
+    setCommitError(null);
 
-    const toUpsert = dirtyEvents.map(({ _dirty, ...e }) => e);
-    const { error } = await supabase.from("events").upsert(toUpsert);
+    try {
+      const toUpsert = dirtyEvents.map(({ _dirty, ...e }) => ({
+        id:            e.id,
+        batch_id:      e.batch_id,
+        sl_no:         Number(e.sl_no),
+        event_name:    e.event_name   || null,
+        assigned_to:   e.assigned_to  || "Execom",
+        deadline:      e.deadline     || null,
+        reassigned:    e.reassigned   || null,
+        folders_count: Number(e.folders_count) || 0,
+        moms_count:    Number(e.moms_count)    || 0,
+        status:        e.status       || "Pending",
+        notes:         e.notes        || null,
+      }));
 
-    if (!error) {
-      setActiveBatchEvents(prev => prev.map(e => ({ ...e, _dirty: false })));
-      setCommitStatus("ok");
-      setTimeout(() => setCommitStatus(null), 3000);
-    } else {
+      console.log("Upserting:", toUpsert);
+
+      const { error } = await supabase.from("events").upsert(toUpsert, { onConflict: "id" });
+
+      if (error) {
+        console.error("Commit error:", error);
+        setCommitError(error.message);
+        setCommitStatus("err");
+      } else {
+        setActiveBatchEvents(prev => prev.map(e => ({ ...e, _dirty: false })));
+        setCommitStatus("ok");
+        setTimeout(() => setCommitStatus(null), 3000);
+      }
+    } catch (err) {
+      console.error("Commit exception:", err);
+      setCommitError(err.message);
       setCommitStatus("err");
     }
+
     setCommitting(false);
   }
 
   // ── Stats ──
   function batchStats() {
     return {
-      total: activeEvents.length,
-      done: activeEvents.filter(e => e.status === "Done").length,
-      inProgress: activeEvents.filter(e => e.status === "In Progress").length,
+      total:        activeEvents.length,
+      done:         activeEvents.filter(e => e.status === "Done").length,
+      inProgress:   activeEvents.filter(e => e.status === "In Progress").length,
       totalFolders: activeEvents.reduce((s, e) => s + Number(e.folders_count || 0), 0),
-      totalMoms: activeEvents.reduce((s, e) => s + Number(e.moms_count || 0), 0),
+      totalMoms:    activeEvents.reduce((s, e) => s + Number(e.moms_count    || 0), 0),
     };
   }
 
@@ -210,10 +255,10 @@ export default function App() {
     for (const m of activeMembers) {
       const a = activeEvents.filter(e => e.assigned_to === m.name);
       stats[m.name] = {
-        events: a.length,
+        events:  a.length,
         folders: a.reduce((s, e) => s + Number(e.folders_count || 0), 0),
-        moms: a.reduce((s, e) => s + Number(e.moms_count || 0), 0),
-        done: a.filter(e => e.status === "Done").length,
+        moms:    a.reduce((s, e) => s + Number(e.moms_count    || 0), 0),
+        done:    a.filter(e => e.status === "Done").length,
       };
     }
     return stats;
@@ -242,7 +287,10 @@ export default function App() {
           </div>
         ))}
         <button style={S.newBatchBtn} onClick={() => setView("newBatch")}>+ New Batch</button>
-        <div style={S.sidebarFooter}>Documentation Team<br /><span style={{ opacity: 0.4, fontSize: "10px" }}>SEED Club</span></div>
+        <div style={S.sidebarFooter}>
+          Documentation Team<br />
+          <span style={{ opacity: 0.4, fontSize: "10px" }}>SEED Club</span>
+        </div>
       </aside>
 
       {/* MAIN */}
@@ -295,29 +343,29 @@ export default function App() {
                   <button style={S.membersBtn} onClick={() => setShowMemberPanel(p => !p)}>
                     👥 Seed Members ({activeMembers.length})
                   </button>
-
-                  {/* COMMIT BUTTON */}
                   <button
-                    style={{
-                      ...S.commitBtn,
-                      ...(hasDirty ? S.commitBtnActive : S.commitBtnDisabled),
-                    }}
+                    style={{ ...S.commitBtn, ...(hasDirty ? S.commitBtnActive : S.commitBtnDisabled) }}
                     onClick={commitChanges}
                     disabled={!hasDirty || committing}
                   >
-                    {committing ? "Saving…" :
-                     commitStatus === "ok" ? "✓ Saved!" :
-                     commitStatus === "err" ? "✗ Error" :
-                     hasDirty ? `⬆ Commit (${dirtyEvents.length} change${dirtyEvents.length > 1 ? "s" : ""})` :
-                     "✓ All saved"}
+                    {committing        ? "Saving…"
+                     : commitStatus === "ok"  ? "✓ Saved!"
+                     : commitStatus === "err" ? "✗ Error — see console"
+                     : hasDirty ? `⬆ Commit (${dirtyEvents.length})`
+                     : "✓ All saved"}
                   </button>
                 </div>
               </div>
 
+              {/* Error banner */}
+              {commitError && (
+                <div style={S.errorBanner}>✗ Supabase error: {commitError}</div>
+              )}
+
               {/* Dirty banner */}
-              {hasDirty && (
+              {hasDirty && !commitError && (
                 <div style={S.dirtyBanner}>
-                  ⚠ You have {dirtyEvents.length} unsaved change{dirtyEvents.length > 1 ? "s" : ""}. Hit <strong>Commit</strong> to save to Supabase.
+                  ⚠ {dirtyEvents.length} unsaved change{dirtyEvents.length > 1 ? "s" : ""} — hit <strong>Commit</strong> to save.
                 </div>
               )}
 
@@ -366,7 +414,7 @@ export default function App() {
                 <table style={S.table}>
                   <thead>
                     <tr>
-                      {["#", "Event Name", "Assigned To", "Deadline", "Reassigned", "Folders", "MOMs", "Status", "Notes", ""].map((h, i) => (
+                      {["#","Event Name","Assigned To","Deadline","Reassigned","Folders","MOMs","Status","Notes",""].map((h,i) => (
                         <th key={i} style={S.th}>{h}</th>
                       ))}
                     </tr>
@@ -389,13 +437,13 @@ export default function App() {
                         </td>
 
                         <td style={S.td}>
-                          <select style={S.selectCell} value={ev.assigned_to}
+                          <select style={S.selectCell} value={ev.assigned_to || "Execom"}
                             onChange={e => updateEventField(ev.id, "assigned_to", e.target.value)}>
                             {assigneeOptions.map(o => <option key={o}>{o}</option>)}
                           </select>
                         </td>
 
-                        <td style={S.td} onClick={() => startEdit(ev.id, "deadline", ev.deadline)}>
+                        <td style={S.td} onClick={() => startEdit(ev.id, "deadline", ev.deadline || "")}>
                           {editingCell?.eventId === ev.id && editingCell?.field === "deadline"
                             ? <input ref={inputRef} type="date" style={S.cellInput} value={editValue}
                                 onChange={e => setEditValue(e.target.value)}
@@ -410,7 +458,7 @@ export default function App() {
                         <td style={S.td}>
                           <select style={{ ...S.selectCell, color: ev.reassigned ? "#f472b6" : "#555" }}
                             value={ev.reassigned || ""}
-                            onChange={e => updateEventField(ev.id, "reassigned", e.target.value)}>
+                            onChange={e => updateEventField(ev.id, "reassigned", e.target.value || null)}>
                             <option value="">—</option>
                             {assigneeOptions.map(o => <option key={o}>{o}</option>)}
                           </select>
@@ -421,7 +469,7 @@ export default function App() {
                             ? <input ref={inputRef} type="number" min="0" style={{ ...S.cellInput, width: "52px" }}
                                 value={editValue} onChange={e => setEditValue(e.target.value)}
                                 onBlur={commitEdit} onKeyDown={e => e.key === "Enter" && commitEdit()} />
-                            : <span style={{ ...S.cellText, textAlign: "center" }}><span style={S.countBadge}>{ev.folders_count}</span></span>}
+                            : <span style={{ ...S.cellText, textAlign: "center" }}><span style={S.countBadge}>{ev.folders_count || 0}</span></span>}
                         </td>
 
                         <td style={S.td} onClick={() => startEdit(ev.id, "moms_count", ev.moms_count)}>
@@ -429,24 +477,24 @@ export default function App() {
                             ? <input ref={inputRef} type="number" min="0" style={{ ...S.cellInput, width: "52px" }}
                                 value={editValue} onChange={e => setEditValue(e.target.value)}
                                 onBlur={commitEdit} onKeyDown={e => e.key === "Enter" && commitEdit()} />
-                            : <span style={{ ...S.cellText, textAlign: "center" }}><span style={S.countBadge}>{ev.moms_count}</span></span>}
+                            : <span style={{ ...S.cellText, textAlign: "center" }}><span style={S.countBadge}>{ev.moms_count || 0}</span></span>}
                         </td>
 
                         <td style={S.td}>
                           <select style={{
                             ...S.selectCell,
-                            color: STATUS_CONFIG[ev.status].color,
-                            background: STATUS_CONFIG[ev.status].bg,
-                            borderColor: STATUS_CONFIG[ev.status].color + "44",
+                            color: STATUS_CONFIG[ev.status]?.color || "#ccc",
+                            background: STATUS_CONFIG[ev.status]?.bg || "transparent",
+                            borderColor: (STATUS_CONFIG[ev.status]?.color || "#ccc") + "44",
                             fontWeight: "600",
                           }}
-                            value={ev.status}
+                            value={ev.status || "Pending"}
                             onChange={e => updateEventField(ev.id, "status", e.target.value)}>
                             {Object.keys(STATUS_CONFIG).map(s => <option key={s}>{s}</option>)}
                           </select>
                         </td>
 
-                        <td style={S.td} onClick={() => startEdit(ev.id, "notes", ev.notes)}>
+                        <td style={S.td} onClick={() => startEdit(ev.id, "notes", ev.notes || "")}>
                           {editingCell?.eventId === ev.id && editingCell?.field === "notes"
                             ? <input ref={inputRef} style={{ ...S.cellInput, minWidth: "140px" }} value={editValue}
                                 onChange={e => setEditValue(e.target.value)}
@@ -500,7 +548,7 @@ export default function App() {
           <div style={S.modal} onClick={e => e.stopPropagation()}>
             <h3 style={{ color: "#e2c27d", fontFamily: "'Playfair Display', serif", marginBottom: "8px" }}>Delete Batch?</h3>
             <p style={{ color: "#aaa", fontSize: "13px", marginBottom: "20px" }}>
-              This permanently deletes <strong style={{ color: "#fff" }}>{batches.find(b => b.id === confirmDelete)?.name}</strong>, all its events and members.
+              This permanently deletes <strong style={{ color: "#fff" }}>{batches.find(b => b.id === confirmDelete)?.name}</strong> and all its data.
             </p>
             <div style={{ display: "flex", gap: "10px" }}>
               <button style={S.cancelBtn} onClick={() => setConfirmDelete(null)}>Cancel</button>
@@ -577,6 +625,7 @@ const S = {
   commitBtnActive: { background: "#e2c27d", color: "#0d0d0d" },
   commitBtnDisabled: { background: "#1a1a1a", color: "#444", border: "1px solid #2a2a2a", cursor: "default" },
   dirtyBanner: { background: "rgba(245,158,11,0.08)", border: "1px solid rgba(245,158,11,0.2)", borderRadius: "8px", padding: "10px 14px", fontSize: "12px", color: "#f59e0b", marginBottom: "16px" },
+  errorBanner: { background: "rgba(248,113,113,0.08)", border: "1px solid rgba(248,113,113,0.2)", borderRadius: "8px", padding: "10px 14px", fontSize: "12px", color: "#f87171", marginBottom: "16px" },
   statsBar: { display: "flex", gap: "12px", marginBottom: "24px", flexWrap: "wrap" },
   statCard: { flex: "1 1 100px", background: "#111", border: "1px solid", borderRadius: "10px", padding: "14px 16px", display: "flex", flexDirection: "column", gap: "4px" },
   statVal: { fontSize: "26px", fontFamily: "'Playfair Display', serif", lineHeight: 1 },
@@ -597,7 +646,7 @@ const S = {
   table: { width: "100%", borderCollapse: "collapse", minWidth: "900px" },
   th: { padding: "10px 12px", textAlign: "left", fontSize: "9px", letterSpacing: "0.12em", color: "#555", borderBottom: "1px solid #1e1e1e", fontWeight: "500", background: "#0f0f0f", whiteSpace: "nowrap" },
   tr: { borderBottom: "1px solid #191919" },
-  trDirty: { borderLeft: "2px solid #f59e0b44" },
+  trDirty: { borderLeft: "2px solid #f59e0b55" },
   td: { padding: "8px 12px", fontSize: "12px", verticalAlign: "middle" },
   slNo: { width: "24px", height: "24px", background: "#1a1a1a", borderRadius: "4px", display: "inline-flex", alignItems: "center", justifyContent: "center", fontSize: "10px", color: "#555" },
   dirtyDot: { display: "inline-block", width: "5px", height: "5px", borderRadius: "50%", background: "#f59e0b", marginLeft: "4px", verticalAlign: "middle" },
